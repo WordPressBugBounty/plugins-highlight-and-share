@@ -29,7 +29,7 @@ class Emails {
 	 * Display the HTML for the email modal.
 	 */
 	public function ajax_display_has_email_social_modal() {
-		$post_id = absint( filter_input( INPUT_GET, 'post_id', FILTER_VALIDATE_INT ) );
+		$post_id   = absint( filter_input( INPUT_GET, 'post_id', FILTER_VALIDATE_INT ) );
 		$permalink = get_permalink( $post_id );
 		if ( ! wp_verify_nonce( filter_input( INPUT_GET, 'nonce', FILTER_SANITIZE_SPECIAL_CHARS ), 'has_share_email' . $post_id ) ) {
 			wp_die( 'Invalid request.' );
@@ -71,7 +71,7 @@ class Emails {
 			);
 			wp_register_script(
 				'has-recaptcha',
-				esc_url_raw( 'https://www.google.com/recaptcha/api.js?render=' . sanitize_text_field( $recaptcha_site_key ) ),
+				esc_url_raw( 'https://www.google.com/recaptcha/enterprise.js?render=' . sanitize_text_field( $recaptcha_site_key ) ),
 				array(),
 				Functions::get_plugin_version(),
 				true
@@ -101,6 +101,50 @@ class Emails {
 			Functions::get_plugin_version(),
 			false
 		);
+		if ( (bool) $options['turnstile_enabled'] ) {
+			// Load Turnstile local JS.
+			wp_register_script(
+				'has-cf-turnstile-local',
+				Functions::get_plugin_url( '/dist/has-cf-turnstile.js' ),
+				array(),
+				Functions::get_plugin_version(),
+				true
+			);
+			wp_register_script(
+				'has-cf-turnstile',
+				esc_url_raw( 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload=hasInitTurnstile' ),
+				array( 'has-cf-turnstile-local' ),
+				Functions::get_plugin_version(),
+				true
+			);
+
+			// Add localized vars.
+			wp_localize_script(
+				'has-cf-turnstile-local',
+				'hasCfTurnstileLocal',
+				array(
+					'turnstile_enabled' => (bool) $options['turnstile_enabled'],
+					'sitekey'           => sanitize_text_field( $options['turnstile_sitekey'] ),
+					'theme'             => sanitize_text_field( $options['turnstile_theme'] ),
+					'language'          => sanitize_text_field( $options['turnstile_language'] ),
+					'size'              => sanitize_text_field( $options['turnstile_widget_size'] ),
+				)
+			);
+		}
+
+		$classes          = array(
+			'showing-recaptcha' => $recaptcha_enabled && ! empty( $recaptcha_site_key ),
+			'showing-turnstile' => (bool) $options['turnstile_enabled'] && ! empty( $options['turnstile_sitekey'] ),
+		);
+		$scripts_to_print = array(
+			'has_email_view',
+		);
+		if ( $recaptcha_enabled && ! empty( $recaptcha_site_key ) ) {
+			$scripts_to_print[] = 'has-recaptcha';
+		}
+		if ( (bool) $options['turnstile_enabled'] && ! empty( $options['turnstile_sitekey'] ) ) {
+			$scripts_to_print[] = 'has-cf-turnstile';
+		}
 		?>
 		<!DOCTYPE html>
 		<html lang="en">
@@ -111,21 +155,18 @@ class Emails {
 				);
 				?>
 			</head>
-			<body class="<?php echo ( $recaptcha_enabled && ! empty( $recaptcha_site_key ) ) ? 'showing-recaptcha' : ''; ?>">
+			<body class="<?php echo esc_attr( implode( ' ', $classes ) ); ?>">
 				<div id="has-email-interface"></div>
+				<div id="has-turnstile"></div>
 				<?php
 				wp_print_scripts(
-					array(
-						'has_email_view',
-						'has-recaptcha',
-					),
+					$scripts_to_print,
 				);
 				?>
 			</body>
 		</html>
 		<?php
 		exit;
-
 	}
 
 	/**
@@ -159,13 +200,14 @@ class Emails {
 		$options = Options::get_email_options();
 
 		// Get recaptcha keys.
-		$recaptcha_site_key   = $options['recaptcha_site_key'] ?? '';
-		$recaptcha_secret_key = $options['recaptcha_secret_key'] ?? '';
+		$recaptcha_site_key   = sanitize_text_field( $options['recaptcha_site_key'] ?? '' );
 		$recaptcha_enabled    = (bool) ( $options['recaptcha_enabled'] ?? false );
+		$recaptcha_project_id = sanitize_title( $options['recaptcha_project_id'] ?? '' );
+		$recaptcha_api_key    = sanitize_text_field( $options['recaptcha_api_key'] ?? '' );
 		$score_threshold      = (float) ( $options['recaptcha_score_threshold'] ?? 0 );
 
 		if ( $recaptcha_enabled ) {
-			if ( empty( $recaptcha_site_key ) || empty( $recaptcha_secret_key ) ) {
+			if ( empty( $recaptcha_site_key ) ) {
 				wp_send_json_error(
 					array(
 						'message' => __( 'The site owner has not set reCAPTCHA 3 site keys.', 'highlight-and-share' ),
@@ -182,17 +224,23 @@ class Emails {
 			}
 
 			// Now get token back from reCAPTCHA.
-			$url      = 'https://www.google.com/recaptcha/api/siteverify';
+			$url      = 'https://recaptchaenterprise.googleapis.com/v1/projects/' . $recaptcha_project_id . '/assessments?key=' . $recaptcha_api_key;
 			$data     = array(
-				'secret'   => $recaptcha_secret_key,
-				'response' => $token,
+				'event' => array(
+					'token'          => $token,
+					'expectedAction' => 'USER_ACTION',
+					'siteKey'        => $recaptcha_site_key,
+				),
 			);
 			$args     = array(
-				'body'      => $data,
+				'body'      => wp_json_encode( $data ),
 				'method'    => 'POST',
 				'sslverify' => true,
+				'headers'   => array(
+					'Content-Type' => 'application/json',
+				),
 			);
-			$response = wp_remote_post( esc_url( $url ), $args );
+			$response = wp_remote_post( esc_url_raw( $url ), $args );
 			if ( is_wp_error( $response ) ) {
 				wp_send_json_error(
 					array(
@@ -201,7 +249,7 @@ class Emails {
 				);
 			}
 			$body = json_decode( wp_remote_retrieve_body( $response ), true );
-			if ( ! $body['success'] ) {
+			if ( isset( $body['tokenProperties']['valid'] ) && ! (bool) $body['tokenProperties']['valid'] ) {
 				wp_send_json_error(
 					array(
 						'message' => __( 'reCAPTCHA 3 security challenge has failed.', 'highlight-and-share' ),
@@ -210,7 +258,7 @@ class Emails {
 			}
 
 			// Now check the score with threshold.
-			$recaptcha_score = (float) $body['score'];
+			$recaptcha_score = isset( $body['riskAnalysis']['score'] ) ? (float) $body['riskAnalysis']['score'] : 0;
 			if ( $recaptcha_score < $score_threshold ) {
 				wp_send_json_error(
 					array(
@@ -220,6 +268,44 @@ class Emails {
 			}
 		}
 
+		if ( (bool) $options['turnstile_enabled'] ) {
+			$turnstile_token = sanitize_text_field( $ajax_data['turnstileToken'] );
+			if ( empty( $turnstile_token ) ) {
+				wp_send_json_error(
+					array(
+						'message' => __( 'Turnstile token is required.', 'highlight-and-share' ),
+					)
+				);
+			}
+
+			$secret_key = $options['turnstile_secret'];
+			$url        = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+			$data       = array(
+				'secret'   => $secret_key,
+				'response' => $turnstile_token,
+			);
+			$args       = array(
+				'body'      => $data,
+				'method'    => 'POST',
+				'sslverify' => true,
+			);
+			$response   = wp_remote_post( esc_url( $url ), $args );
+			if ( is_wp_error( $response ) ) {
+				wp_send_json_error(
+					array(
+						'message' => __( 'Error validating Turnstile token.', 'highlight-and-share' ),
+					)
+				);
+			}
+			$body = json_decode( wp_remote_retrieve_body( $response ), true );
+			if ( ! $body['success'] ) {
+				wp_send_json_error(
+					array(
+						'message' => __( 'Turnstile security challenge has failed.', 'highlight-and-share' ),
+					)
+				);
+			}
+		}
 		// Get email name and address from options.
 		$email_name = trim( sanitize_text_field( $options['from_name'] ) );
 		$email_from = trim( sanitize_text_field( $options['from_email'] ) );
